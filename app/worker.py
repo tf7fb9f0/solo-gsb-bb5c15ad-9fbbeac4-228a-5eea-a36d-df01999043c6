@@ -63,15 +63,33 @@ async def _process_task(task: dict, db: Database, client: httpx.AsyncClient) -> 
         return
 
     body = task["payload"].encode("utf-8")
+    # Signatures are computed from the subscription state read at claim time
+    # for this particular attempt; every retry re-claims the task and picks
+    # up the then-current secrets, so retries always sign with the state at
+    # the time they are actually sent.
+    sent_at = time.time()
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "local-webhook-relay/1.0",
         "X-Webhook-Event-Id": task["event_id"],
         "X-Webhook-Task-Id": str(task_id),
         "X-Webhook-Attempt": str(attempt_no),
-        "X-Webhook-Timestamp": str(int(time.time())),
+        "X-Webhook-Timestamp": str(int(sent_at)),
         "X-Webhook-Signature": signing.signature_header(task["secret"], body),
     }
+    # During a rotation grace window the previous secret is still accepted by
+    # receivers that have not switched yet, so attach a second signature. The
+    # expiry is re-checked against the actual send time in case the window
+    # elapsed between the claim query and now.
+    previous_expires = task.get("previous_secret_expires_at")
+    if (
+        task.get("previous_secret")
+        and previous_expires is not None
+        and sent_at < previous_expires
+    ):
+        headers["X-Webhook-Signature-Previous"] = signing.signature_header(
+            task["previous_secret"], body
+        )
 
     started = time.time()
     status_code: int | None = None

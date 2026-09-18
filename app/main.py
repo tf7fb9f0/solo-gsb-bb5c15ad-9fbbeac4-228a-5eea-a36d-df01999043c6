@@ -19,6 +19,7 @@ from .schemas import (
     EventCreate,
     EventStatus,
     IngestEvent,
+    SecretRotate,
     SubscriptionCreate,
     SubscriptionOut,
 )
@@ -41,6 +42,7 @@ def _sub_out(sub: dict) -> dict:
         "created_at": _iso(sub["created_at"]),
         "paused": sub["paused_at"] is not None,
         "paused_at": _iso(sub["paused_at"]),
+        "previous_secret_expires_at": _iso(sub.get("previous_secret_expires_at")),
     }
 
 
@@ -131,6 +133,38 @@ def resume_subscription(sub_id: str) -> dict:
     sub = app.state.db.set_subscription_paused(sub_id, False)
     if sub is None:
         raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return _sub_out(sub)
+
+
+@app.post("/subscriptions/{sub_id}/rotate-secret", response_model=SubscriptionOut)
+def rotate_subscription_secret(sub_id: str, body: SecretRotate) -> dict:
+    """Rotate a subscription's outbound signing secret, with an optional grace
+    period.
+
+    The new secret and the old secret's expiry time are persisted atomically.
+    For grace_seconds > 0, every delivery during the window carries both
+    X-Webhook-Signature (new secret) and X-Webhook-Signature-Previous (old
+    secret); afterwards only the new signature is sent. Starting another
+    rotation while a grace window is open returns 409. grace_seconds = 0 makes
+    the old secret invalid immediately. Secrets are never returned in any
+    response or written to logs.
+    """
+    status, sub = app.state.db.rotate_secret(sub_id, body.new_secret, body.grace_seconds)
+    if status == "missing":
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    if status == "rotation_active":
+        existing = app.state.db.get_subscription(sub_id)
+        raise HTTPException(
+            409,
+            "a secret rotation is already within its grace period; "
+            f"wait until previous_secret_expires_at ({_iso(existing['previous_secret_expires_at'])}) "
+            "before rotating again",
+        )
+    log.info(
+        "rotated signing secret for subscription %s (grace %ss)",
+        sub_id,
+        body.grace_seconds,
+    )
     return _sub_out(sub)
 
 

@@ -18,7 +18,10 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     target_url  TEXT NOT NULL,
     secret      TEXT NOT NULL,
     created_at  REAL NOT NULL,
-    paused_at   REAL                   -- epoch seconds while paused; NULL when active
+    paused_at   REAL,                  -- epoch seconds while paused; NULL when active
+    previous_secret             TEXT,  -- pre-rotation secret, kept during grace period
+    previous_secret_expires_at  REAL   -- epoch when previous_secret stops being signed;
+                                       -- NULL when no rotation is in its grace period
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -69,6 +72,13 @@ CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts (task_id);
 
 
 class Database:
+    # Columns that are safe to return to API callers -- secrets (current and
+    # previous) are deliberately excluded so they can never leak into a query
+    # response via a SELECT * on the subscriptions table.
+    SUBSCRIPTION_OUT_COLS = (
+        "id, target_url, created_at, paused_at, previous_secret_expires_at"
+    )
+
     def __init__(self, path: str):
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -89,6 +99,41 @@ class Database:
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(subscriptions)")}
         if "paused_at" not in cols:
             self._conn.execute("ALTER TABLE subscriptions ADD COLUMN paused_at REAL")
+        # Secret rotation (added later): previous_secret and its expiry are
+        # set together while a rotation is inside its grace period and both
+        # cleared once the grace period elapses.
+        if "previous_secret" not in cols:
+            self._conn.execute("ALTER TABLE subscriptions ADD COLUMN previous_secret TEXT")
+        if "previous_secret_expires_at" not in cols:
+            self._conn.execute("ALTER TABLE subscriptions ADD COLUMN previous_secret_expires_at REAL")
+        self._purge_expired_previous_secrets_locked()
+
+    def _purge_expired_previous_secrets_locked(self, now: float | None = None) -> int:
+        """Drop previous secrets whose grace period has elapsed.
+
+        Caller must hold the connection lock (used at startup and inside the
+        claim transaction). The existence check avoids a write transaction on
+        every idle poll. Returns the number of rows updated.
+        """
+        if now is None:
+            now = time.time()
+        due = self._conn.execute(
+            """SELECT 1 FROM subscriptions
+                WHERE previous_secret_expires_at IS NOT NULL
+                  AND previous_secret_expires_at <= ?
+                LIMIT 1""",
+            (now,),
+        ).fetchone()
+        if due is None:
+            return 0
+        cur = self._conn.execute(
+            """UPDATE subscriptions
+                  SET previous_secret = NULL, previous_secret_expires_at = NULL
+                WHERE previous_secret_expires_at IS NOT NULL
+                  AND previous_secret_expires_at <= ?""",
+            (now,),
+        )
+        return cur.rowcount
 
     def close(self) -> None:
         with self._lock:
@@ -106,19 +151,25 @@ class Database:
                 (sub_id, target_url, secret, now),
             )
             self._conn.commit()
-        return {"id": sub_id, "target_url": target_url, "created_at": now, "paused_at": None}
+        return {
+            "id": sub_id,
+            "target_url": target_url,
+            "created_at": now,
+            "paused_at": None,
+            "previous_secret_expires_at": None,
+        }
 
     def list_subscriptions(self) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, target_url, created_at, paused_at FROM subscriptions ORDER BY created_at"
+                f"SELECT {self.SUBSCRIPTION_OUT_COLS} FROM subscriptions ORDER BY created_at"
             ).fetchall()
         return [dict(r) for r in rows]
 
     def get_subscription(self, sub_id: str) -> dict | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, target_url, created_at, paused_at FROM subscriptions WHERE id = ?",
+                f"SELECT {self.SUBSCRIPTION_OUT_COLS} FROM subscriptions WHERE id = ?",
                 (sub_id,),
             ).fetchone()
         return dict(row) if row else None
@@ -150,10 +201,61 @@ class Database:
                 )
             self._conn.commit()
             row = self._conn.execute(
-                "SELECT id, target_url, created_at, paused_at FROM subscriptions WHERE id = ?",
+                f"SELECT {self.SUBSCRIPTION_OUT_COLS} FROM subscriptions WHERE id = ?",
                 (sub_id,),
             ).fetchone()
         return dict(row)
+
+    def rotate_secret(
+        self, sub_id: str, new_secret: str, grace_seconds: int
+    ) -> tuple[str, dict | None]:
+        """Atomically rotate a subscription's signing secret.
+
+        Stores the new secret as the current one and, when grace_seconds > 0,
+        retains the old secret in previous_secret with previous_secret_expires_at
+        set to now + grace_seconds. The read, 409 check and writes run in one
+        transaction so a second rotation can never interleave.
+
+        Returns one of:
+            ("ok", subscription_out)   -- rotation persisted
+            ("rotation_active", None) -- a previous rotation is still inside
+                                         its grace period (HTTP 409)
+            ("missing", None)         -- unknown subscription id (HTTP 404)
+        """
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT secret, previous_secret_expires_at FROM subscriptions WHERE id = ?",
+                (sub_id,),
+            ).fetchone()
+            if row is None:
+                return "missing", None
+            if row["previous_secret_expires_at"] is not None and now < row["previous_secret_expires_at"]:
+                return "rotation_active", None
+            if grace_seconds > 0:
+                self._conn.execute(
+                    """UPDATE subscriptions
+                          SET secret = ?, previous_secret = secret,
+                              previous_secret_expires_at = ?
+                        WHERE id = ?""",
+                    (new_secret, now + grace_seconds, sub_id),
+                )
+            else:
+                # No grace window: the old secret is invalid immediately and
+                # must not be retained anywhere on the row.
+                self._conn.execute(
+                    """UPDATE subscriptions
+                          SET secret = ?, previous_secret = NULL,
+                              previous_secret_expires_at = NULL
+                        WHERE id = ?""",
+                    (new_secret, sub_id),
+                )
+            self._conn.commit()
+            row = self._conn.execute(
+                f"SELECT {self.SUBSCRIPTION_OUT_COLS} FROM subscriptions WHERE id = ?",
+                (sub_id,),
+            ).fetchone()
+        return "ok", dict(row)
 
     def subscription_exists(self, sub_id: str) -> bool:
         with self._lock:
@@ -310,8 +412,13 @@ class Database:
         run to completion.
         """
         with self._lock:
+            # Expire any elapsed grace windows before evaluating claims, in
+            # the same transaction, so a claimed task always sees post-expiry
+            # state (current secret only).
+            self._purge_expired_previous_secrets_locked(now)
             row = self._conn.execute(
-                """SELECT t.*, s.target_url, s.secret, e.payload
+                """SELECT t.*, s.target_url, s.secret,
+                          s.previous_secret, s.previous_secret_expires_at, e.payload
                    FROM tasks t
                    LEFT JOIN subscriptions s ON s.id = t.subscription_id
                    LEFT JOIN events e ON e.id = t.event_id

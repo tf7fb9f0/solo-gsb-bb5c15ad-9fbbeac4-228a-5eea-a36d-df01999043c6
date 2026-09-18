@@ -5,6 +5,7 @@
 ## 功能特性
 
 - **订阅管理**：创建/查询/删除订阅（目标 URL + secret）
+- **签名密钥平滑轮换**：`POST /subscriptions/{id}/rotate-secret` 原子写入新密钥与旧密钥失效时间；宽限期内每次出站投递同时携带新密钥签名 `X-Webhook-Signature` 与旧密钥签名 `X-Webhook-Signature-Previous`，宽限期满后只发新签名；宽限期内再次轮换返回 `409`；轮换状态持久化、重启后保持；任务重试按**每次实际发送时**的密钥状态签名；任何查询响应与日志都不会包含密钥
 - **订阅暂停/恢复**：`POST /subscriptions/{id}/pause` 暂停后不再领取该订阅的新任务（已 `in_progress` 的尝试正常完成），暂停期间提交的事件照常入库并保持 `pending`；`/resume` 恢复后按原 `next_attempt_at` 与 `task_id` 顺序继续投递，不批量改写调度时间；暂停状态持久化在 SQLite 中，重启后保持
 - **HMAC 受保护入站接口**：`POST /ingest` 使用 `INGEST_SECRET` 校验 `X-Webhook-Signature`（覆盖时间戳、ID 与原始 JSON），并强制 ±300 秒时间窗
 - **入站幂等与防重放**：已接收的 `X-Webhook-Id` 持久化在 SQLite 中；重复 ID + 相同内容返回首次接收结果且不重复投递，相同 ID 不同内容返回 `409`
@@ -53,7 +54,7 @@ curl -s -X POST http://localhost:8000/subscriptions \
 ```
 
 ```json
-{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": false, "paused_at": null}
+{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": false, "paused_at": null, "previous_secret_expires_at": null}
 ```
 
 ### 2. 提交入站事件（HMAC 保护，POST /ingest）
@@ -197,16 +198,73 @@ curl -s -X POST http://localhost:8000/subscriptions/44a79d7077ce/resume
 - **状态可见**：`GET /subscriptions` 与 `GET /subscriptions/{id}` 返回 `paused`（布尔）与 `paused_at`（ISO 时间或 `null`）。
 - **持久化**：暂停状态存储在 SQLite 的 `subscriptions.paused_at` 列中，服务（或容器）重启后保持。
 
+### 6. 轮换订阅签名密钥（平滑切换）
+
+```bash
+curl -s -X POST http://localhost:8000/subscriptions/44a79d7077ce/rotate-secret \
+  -H 'Content-Type: application/json' \
+  -d '{"new_secret": "my-secret-v2", "grace_seconds": 86400}'
+```
+
+```json
+{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": false, "paused_at": null, "previous_secret_expires_at": "2026-09-19T08:30:00+00:00"}
+```
+
+请求体：
+
+| 字段 | 约束 | 说明 |
+|------|------|------|
+| `new_secret` | 非空，1–256 字符 | 轮换后用于 `X-Webhook-Signature` 的新密钥 |
+| `grace_seconds` | 整数，`0`–`86400`（24 小时） | 旧密钥签名的宽限秒数；`0` 表示旧密钥立即失效 |
+
+行为约定：
+
+- **原子保存**：新密钥与旧密钥失效时间在同一个 SQLite 事务中写入（旧密钥保存为 `previous_secret`，失效时间为 `now + grace_seconds`），不会出现只写一半的中间状态。
+- **宽限期内双签名**：宽限期内每次出站投递同时携带
+  - `X-Webhook-Signature`：按**新**密钥生成（`sha256=<HMAC-SHA256(new_secret, 请求体)>`）；
+  - `X-Webhook-Signature-Previous`：按**旧**密钥生成（计算方式相同，只是密钥为轮换前的旧值）。
+- **宽限期满**：旧密钥被清除，投递只携带新密钥签名（在任务认领时的同一事务中检查并清除，服务重启时也会清理已到期的旧密钥）。
+- **按实际发送时签名**：签名在每次发送时依据该订阅当时的密钥状态计算；失败重试每次都会重新读取密钥状态，因此一次轮换可能让同一任务的不同尝试分别携带单签名/双签名——这正是预期行为。
+- **宽限期内再次轮换返回 409**：为避免在旧密钥尚未失效时丢掉"上一版"密钥，同一订阅在宽限期内只能轮换一次；响应中给出当前宽限的到期时间。到期后（或 `grace_seconds=0` 后）才能再次轮换。
+- **`grace_seconds=0`**：旧密钥立即失效且不被保留，此后的投递只发新签名；立即再次轮换不会返回 409。
+- **订阅不存在**：返回 `404`。请求体校验失败（超出 0–86400、密钥为空或过长）：`422`。
+- **状态可见**：订阅查询（列表/详情/轮换响应）新增 `previous_secret_expires_at` 字段（ISO 时间，未轮换或宽限期已结束时为 `null`），接收方可据此判断双签名窗口何时关闭。
+- **密钥保密**：当前密钥与旧密钥**均不会**出现在任何查询响应中（响应只含失效时间），服务端日志只记录订阅 ID 与宽限时长，不记录密钥内容。
+- **持久化**：轮换状态（新密钥、旧密钥、失效时间）存储在 SQLite 中，服务（或容器）重启后保持；宽限期跨重启继续有效，到期清理同样在启动时执行。
+
+#### 接收方切换流程（建议）
+
+1. **先升级接收端**：把验签逻辑改为"接受新签名，也接受旧签名"——优先校验 `X-Webhook-Signature`（新密钥），同时允许 `X-Webhook-Signature-Previous`（旧密钥）通过；两个头都校验失败才拒绝。
+2. **发起轮换**：调用 `rotate-secret`，设置足够接收端完成部署的 `grace_seconds`（最长 24 小时）。
+3. **观察双签名窗口**：此后收到的投递同时带两个签名头；尚未升级的旧接收端仍可用旧签名（此时旧签名位于 `X-Webhook-Signature-Previous`，旧接收端若只读 `X-Webhook-Signature` 则必须先完成第 1 步再轮换）。
+4. **全量切换并确认**：确认所有接收端已部署新密钥、并且能稳定校验新签名后，等待宽限期结束（或直接把宽限设为 `0` 再轮换一次——注意此时旧密钥即刻失效）。
+5. **窗口结束**：中继清除旧密钥，投递只携带 `X-Webhook-Signature`，接收端可随后移除旧密钥与 `X-Webhook-Signature-Previous` 的校验分支。
+
+接收端双密钥验签示例：
+
+```python
+import hashlib, hmac
+
+def is_valid(old_secret: str, new_secret: str, body: bytes,
+             sig: str | None, sig_previous: str | None) -> bool:
+    def h(secret: str) -> str:
+        return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    # 新签名优先；旧签名仅在宽限期内随 X-Webhook-Signature-Previous 出现
+    return (sig is not None and hmac.compare_digest(h(new_secret), sig)) or \
+           (sig_previous is not None and hmac.compare_digest(h(old_secret), sig_previous))
+```
+
 ### 其他端点
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `POST` | `/ingest` | HMAC 保护的入站事件接口（时间窗 + 签名 + ID 幂等） |
 | `POST` | `/events` | 内部提交事件（event_id + payload，无需签名） |
-| `GET` | `/subscriptions` | 列出全部订阅（含 `paused` / `paused_at`） |
-| `GET` | `/subscriptions/{id}` | 查询单个订阅（含 `paused` / `paused_at`） |
+| `GET` | `/subscriptions` | 列出全部订阅（含 `paused` / `paused_at` / `previous_secret_expires_at`） |
+| `GET` | `/subscriptions/{id}` | 查询单个订阅（含 `paused` / `paused_at` / `previous_secret_expires_at`） |
 | `POST` | `/subscriptions/{id}/pause` | 暂停订阅投递（幂等，不存在返回 404） |
 | `POST` | `/subscriptions/{id}/resume` | 恢复订阅投递（幂等，不存在返回 404） |
+| `POST` | `/subscriptions/{id}/rotate-secret` | 轮换签名密钥（宽限期 0–86400 秒；宽限期内再轮换返回 409，不存在返回 404） |
 | `DELETE` | `/subscriptions/{id}` | 删除订阅（已有任务保留历史） |
 | `GET` | `/healthz` | 健康检查 |
 
@@ -226,11 +284,14 @@ curl -s -X POST http://localhost:8000/subscriptions/44a79d7077ce/resume
 
 | 头部 | 说明 |
 |------|------|
-| `X-Webhook-Signature` | `sha256=<HMAC-SHA256(secret, 请求体)>` 十六进制摘要 |
+| `X-Webhook-Signature` | `sha256=<HMAC-SHA256(当前 secret, 请求体)>` 十六进制摘要 |
+| `X-Webhook-Signature-Previous` | **仅在密钥轮换宽限期内**出现：按轮换前的旧 secret 计算的同样格式签名；宽限期结束后不再发送 |
 | `X-Webhook-Event-Id` | 事件 ID |
 | `X-Webhook-Task-Id` | 投递任务 ID |
 | `X-Webhook-Attempt` | 当前第几次尝试 |
 | `X-Webhook-Timestamp` | 发送时间戳（秒） |
+
+> 每次尝试（含失败重试）都按发送当时订阅的密钥状态签名：宽限期内携带双签名，宽限期外只携带新签名。接收端的切换步骤见上文[「轮换订阅签名密钥」](#6-轮换订阅签名密钥平滑切换)。
 
 Python 验签示例：
 
@@ -249,6 +310,7 @@ def is_valid(secret: str, body: bytes, signature_header: str) -> bool:
 - **原子认领**：工作器在单个连接锁保护的临界区内完成「选中最旧到期任务 → 置为 `in_progress`」，并发工作器不会领到同一任务。
 - **按订阅有序**：认领查询附带 `NOT EXISTS` 条件——同订阅存在 id 更小且状态为 `pending`/`in_progress` 的任务时，当前任务不可认领；只有前序任务进入终态（`delivered`/`failed`）才放行下一条。条件针对持久化状态在认领时求值，故重试退避、崩溃恢复（`in_progress` 重置为 `pending` 后依然阻塞后续任务）与多工作器并发下均成立；不同订阅互不影响，可并行投递。
 - **订阅暂停**：暂停只是翻转 `subscriptions.paused_at` 标记（首次暂停的时间戳，重复暂停不变），从不修改任务行。认领查询增加 `s.paused_at IS NULL` 条件，与有序约束在同一原子临界区内求值，因此暂停对已 `in_progress` 的尝试（至多 `WORKER_COUNT` 个并发）无影响、它们照常完成，而新的认领立即停摆；恢复时清除标记即可，所有 `pending` 任务保留原 `next_attempt_at` 与 `task_id` 顺序，无需任何批量更新。
+- **密钥轮换**：`subscriptions` 表在 `secret` 之外增加 `previous_secret` 与 `previous_secret_expires_at` 两列（旧库通过 `ALTER TABLE` 平滑迁移）。轮换在单个事务内把当前 `secret` 移到 `previous_secret`、写入新 `secret` 与失效时间，故新密钥与旧密钥失效时间原子可见；宽限期内再次轮换在同一临界区内检测到未到期的 `previous_secret_expires_at` 即返回冲突，杜绝交错轮换。工作器在每次认领事务中先清理已到期的旧密钥（先查后写，空闲轮询不产生写事务），并在发送时用实际发送时间再次比较失效时刻——因此到期边界、重试退避与重启恢复后都不会再携带旧签名；反过来，重启时宽限尚未到期则旧密钥继续随投递发送。密钥列从不进入任何查询响应（SELECT 显式列举安全列），日志只记录订阅 ID 与宽限时长。
 - **崩溃恢复**：启动时将残留的 `in_progress` 任务重置为 `pending` 并立即到期；`pending` 任务按原 `next_attempt_at` 继续调度。
 - **退避策略**：第 n 次失败后延迟 `2^(n-1)` 秒（1、2、4），第 4 次失败后任务终止，结果为 `failed`。
 - **成功判定**：仅 HTTP 2xx 视为成功；其余状态码、连接错误、超时均触发重试。

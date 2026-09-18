@@ -19,12 +19,20 @@ class SubscriptionCreate(BaseModel):
         return v
 
 
+class SecretRotate(BaseModel):
+    new_secret: str = Field(min_length=1, max_length=256)
+    grace_seconds: int = Field(ge=0, le=86400)
+
+
 class SubscriptionOut(BaseModel):
     id: str
     target_url: str
     created_at: str
     paused: bool
     paused_at: str | None
+    # ISO timestamp until which X-Webhook-Signature-Previous is also sent;
+    # null when no rotation is inside its grace period. Never a secret value.
+    previous_secret_expires_at: str | None = None
 
 
 class EventCreate(BaseModel):
