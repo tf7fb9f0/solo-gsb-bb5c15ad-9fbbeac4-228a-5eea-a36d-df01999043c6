@@ -19,6 +19,7 @@ from .schemas import (
     EventCreate,
     EventStatus,
     IngestEvent,
+    SecretRotationCreate,
     SubscriptionCreate,
     SubscriptionOut,
 )
@@ -35,12 +36,21 @@ def _iso(ts: float | None) -> str | None:
 
 
 def _sub_out(sub: dict) -> dict:
-    """Serialize a subscription row for the API, deriving the paused flag."""
+    """Serialize a subscription row for the API, deriving the paused flag.
+
+    Secret material (current or previous) is never included; only the
+    rotation state (flag + grace expiry) is exposed.
+    """
+    grace_expires = sub.get("previous_secret_expires_at")
+    rotating = grace_expires is not None and grace_expires > time.time()
     return {
-        **sub,
+        "id": sub["id"],
+        "target_url": sub["target_url"],
         "created_at": _iso(sub["created_at"]),
         "paused": sub["paused_at"] is not None,
         "paused_at": _iso(sub["paused_at"]),
+        "rotating": rotating,
+        "previous_secret_expires_at": _iso(grace_expires) if rotating else None,
     }
 
 
@@ -131,6 +141,25 @@ def resume_subscription(sub_id: str) -> dict:
     sub = app.state.db.set_subscription_paused(sub_id, False)
     if sub is None:
         raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return _sub_out(sub)
+
+
+@app.post("/subscriptions/{sub_id}/rotate-secret", response_model=SubscriptionOut)
+def rotate_subscription_secret(sub_id: str, body: SecretRotationCreate) -> dict:
+    """Rotate the delivery-signing secret with a dual-sign grace window.
+
+    The new secret takes effect immediately for the X-Webhook-Signature
+    header; during grace_seconds the previous secret is additionally sent
+    as X-Webhook-Signature-Previous so receivers can switch over safely.
+    A second rotation while the grace window is still open is rejected.
+    """
+    status, sub = app.state.db.rotate_secret(sub_id, body.new_secret, body.grace_seconds)
+    if status == "not_found":
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    if status == "in_grace":
+        until = _iso(sub["previous_secret_expires_at"])
+        raise HTTPException(409, f"a secret rotation is already in progress until {until}")
+    log.info("subscription %s rotated signing secret (grace %.0fs)", sub_id, body.grace_seconds)
     return _sub_out(sub)
 
 

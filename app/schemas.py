@@ -25,6 +25,19 @@ class SubscriptionOut(BaseModel):
     created_at: str
     paused: bool
     paused_at: str | None
+    rotating: bool
+    previous_secret_expires_at: str | None
+
+
+class SecretRotationCreate(BaseModel):
+    """Body of POST /subscriptions/{id}/rotate-secret.
+
+    grace_seconds bounds how long deliveries are dual-signed with both the
+    new and the previous secret (0 = switch immediately, max 24h).
+    """
+
+    new_secret: str = Field(min_length=1, max_length=256)
+    grace_seconds: float = Field(ge=0, le=86400)
 
 
 class EventCreate(BaseModel):

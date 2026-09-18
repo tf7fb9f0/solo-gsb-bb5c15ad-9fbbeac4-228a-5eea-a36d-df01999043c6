@@ -18,7 +18,9 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     target_url  TEXT NOT NULL,
     secret      TEXT NOT NULL,
     created_at  REAL NOT NULL,
-    paused_at   REAL                   -- epoch seconds while paused; NULL when active
+    paused_at   REAL,                   -- epoch seconds while paused; NULL when active
+    previous_secret            TEXT,    -- retired secret, dual-signed during the grace window
+    previous_secret_expires_at REAL     -- epoch seconds when the previous secret stops being sent
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -89,6 +91,12 @@ class Database:
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(subscriptions)")}
         if "paused_at" not in cols:
             self._conn.execute("ALTER TABLE subscriptions ADD COLUMN paused_at REAL")
+        if "previous_secret" not in cols:
+            self._conn.execute("ALTER TABLE subscriptions ADD COLUMN previous_secret TEXT")
+        if "previous_secret_expires_at" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN previous_secret_expires_at REAL"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -106,19 +114,27 @@ class Database:
                 (sub_id, target_url, secret, now),
             )
             self._conn.commit()
-        return {"id": sub_id, "target_url": target_url, "created_at": now, "paused_at": None}
+        return {
+            "id": sub_id,
+            "target_url": target_url,
+            "created_at": now,
+            "paused_at": None,
+            "previous_secret_expires_at": None,
+        }
 
     def list_subscriptions(self) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, target_url, created_at, paused_at FROM subscriptions ORDER BY created_at"
+                """SELECT id, target_url, created_at, paused_at, previous_secret_expires_at
+                   FROM subscriptions ORDER BY created_at"""
             ).fetchall()
         return [dict(r) for r in rows]
 
     def get_subscription(self, sub_id: str) -> dict | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, target_url, created_at, paused_at FROM subscriptions WHERE id = ?",
+                """SELECT id, target_url, created_at, paused_at, previous_secret_expires_at
+                   FROM subscriptions WHERE id = ?""",
                 (sub_id,),
             ).fetchone()
         return dict(row) if row else None
@@ -150,10 +166,58 @@ class Database:
                 )
             self._conn.commit()
             row = self._conn.execute(
-                "SELECT id, target_url, created_at, paused_at FROM subscriptions WHERE id = ?",
+                """SELECT id, target_url, created_at, paused_at, previous_secret_expires_at
+                   FROM subscriptions WHERE id = ?""",
                 (sub_id,),
             ).fetchone()
         return dict(row)
+
+    def rotate_secret(self, sub_id: str, new_secret: str, grace_seconds: float) -> tuple[str, dict | None]:
+        """Rotate a subscription's delivery-signing secret, atomically.
+
+        The current secret becomes the previous secret and keeps being sent
+        (as X-Webhook-Signature-Previous) until now + grace_seconds; with
+        grace_seconds == 0 the switch is immediate and no previous secret is
+        kept. While an earlier rotation's grace window is still open the
+        rotation is refused ('in_grace'); once that window has expired the
+        retired secret is silently discarded by the next rotation.
+
+        previous_secret and previous_secret_expires_at are always set or
+        cleared together, so readers can rely on the timestamp alone.
+
+        Returns ("rotated", row) | ("not_found", None) | ("in_grace", row);
+        the row never contains secret material.
+        """
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT secret, previous_secret_expires_at FROM subscriptions WHERE id = ?",
+                (sub_id,),
+            ).fetchone()
+            if row is None:
+                return "not_found", None
+            expires = row["previous_secret_expires_at"]
+            if expires is not None and expires > now:
+                status = "in_grace"
+            else:
+                if grace_seconds > 0:
+                    previous, previous_expires = row["secret"], now + grace_seconds
+                else:
+                    previous, previous_expires = None, None
+                self._conn.execute(
+                    """UPDATE subscriptions
+                       SET secret = ?, previous_secret = ?, previous_secret_expires_at = ?
+                       WHERE id = ?""",
+                    (new_secret, previous, previous_expires, sub_id),
+                )
+                status = "rotated"
+            self._conn.commit()
+            row = self._conn.execute(
+                """SELECT id, target_url, created_at, paused_at, previous_secret_expires_at
+                   FROM subscriptions WHERE id = ?""",
+                (sub_id,),
+            ).fetchone()
+        return status, dict(row)
 
     def subscription_exists(self, sub_id: str) -> bool:
         with self._lock:
@@ -311,7 +375,8 @@ class Database:
         """
         with self._lock:
             row = self._conn.execute(
-                """SELECT t.*, s.target_url, s.secret, e.payload
+                """SELECT t.*, s.target_url, s.secret, s.previous_secret,
+                          s.previous_secret_expires_at, e.payload
                    FROM tasks t
                    LEFT JOIN subscriptions s ON s.id = t.subscription_id
                    LEFT JOIN events e ON e.id = t.event_id

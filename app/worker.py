@@ -63,15 +63,25 @@ async def _process_task(task: dict, db: Database, client: httpx.AsyncClient) -> 
         return
 
     body = task["payload"].encode("utf-8")
+    now = time.time()
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "local-webhook-relay/1.0",
         "X-Webhook-Event-Id": task["event_id"],
         "X-Webhook-Task-Id": str(task_id),
         "X-Webhook-Attempt": str(attempt_no),
-        "X-Webhook-Timestamp": str(int(time.time())),
+        "X-Webhook-Timestamp": str(int(now)),
         "X-Webhook-Signature": signing.signature_header(task["secret"], body),
     }
+    # During a secret-rotation grace window, additionally send the signature
+    # made with the previous secret so receivers can switch over safely. The
+    # window is evaluated at each actual send (secrets are re-read from the
+    # DB on every claim), so retries always reflect the rotation state in
+    # effect at that moment; once it expires only the new signature is sent.
+    prev_secret = task.get("previous_secret")
+    prev_expires = task.get("previous_secret_expires_at")
+    if prev_secret and prev_expires is not None and now < prev_expires:
+        headers["X-Webhook-Signature-Previous"] = signing.signature_header(prev_secret, body)
 
     started = time.time()
     status_code: int | None = None
